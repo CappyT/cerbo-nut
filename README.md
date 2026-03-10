@@ -14,6 +14,9 @@ The server listens for MQTT messages from Venus OS and translates them into NUT 
 
 ## Compilation
 
+> [!IMPORTANT]
+> Before compiling, open `main.go` and review the `CONFIGURATION BLOCK` at the top of the file. You should customize variables like `InverterMaxVA`, `BatteryCapacityWh`, and `DeviceModel` to match your specific hardware setup.
+
 Since the Cerbo GX uses an ARM architecture (usually ARMv7), you need to cross-compile the binary if you are developing on a different architecture (like x86_64).
 
 ### Local Compilation (Your machine)
