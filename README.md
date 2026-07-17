@@ -22,6 +22,19 @@ The `battery.runtime` value is computed differently depending on the power sourc
 - **SoC reserve**: if the ESS minimum SoC limit is published on MQTT (`Settings/CGwacs/BatteryLife/MinimumSocLimit`) it is used as the unusable reserve; otherwise a conservative 10% default applies.
 - **Persistence**: the learned model is saved to `/data/cerbo-nut/calibration.json` (configurable via `--calib-file`, empty string disables it) so it survives restarts and firmware updates. The write policy is deliberately flash-friendly: learning only happens while discharging, so the disk is written exactly once per discharge event (right after it ends) plus once on graceful shutdown — normal grid operation never writes to the NAND at all. Writes are atomic (temp file + rename).
 
+## Releases
+
+Prebuilt binaries are published on the [GitHub Releases page](../../releases) for `linux-armv7` (Cerbo GX), `linux-arm64`, and `linux-amd64`, along with SHA-256 checksums. If you just want to run the server, download the `armv7` binary from the latest release and skip the compilation section.
+
+Releases follow [semantic versioning](https://semver.org/) and are cut by pushing a tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The `release` workflow then cross-compiles the binaries (stamping the version into the build), generates release notes, and attaches everything to the GitHub release. Every push and pull request is also built and vetted by the `ci` workflow.
+
 ## Compilation
 
 > [!IMPORTANT]

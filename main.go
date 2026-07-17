@@ -61,6 +61,10 @@ const (
 	modelIdleMax    = 100.0
 )
 
+// version is stamped at build time by the release workflow via
+// -ldflags "-X main.version=vX.Y.Z"
+var version = "dev"
+
 // Global variables for command line flags
 var (
 	verboseMode   bool
@@ -125,7 +129,7 @@ func main() {
 	flag.StringVar(&calibFilePath, "calib-file", "/data/cerbo-nut/calibration.json", "File where the learned load model is persisted (empty to disable)")
 	flag.Parse()
 
-	log.Println("Starting Victron-NUT Server for Cerbo GX...")
+	log.Printf("Starting Victron-NUT Server for Cerbo GX (%s)...", version)
 	if verboseMode {
 		log.Println("Verbose mode ACTIVE: connection and debug logs enabled.")
 	}
@@ -481,8 +485,8 @@ func generateNUTVars() map[string]string {
 	vars := make(map[string]string)
 
 	vars["driver.name"] = "dummy-victron"
-	vars["driver.version"] = "1.0"
-	vars["driver.version.internal"] = "1.0"
+	vars["driver.version"] = version
+	vars["driver.version.internal"] = version
 	vars["driver.parameter.port"] = "mqtt"
 
 	vars["device.mfr"] = DeviceManufacturer
