@@ -61,7 +61,7 @@ Behavior follows the NUT protocol (RFC 9271), matching what a real `upsd` does:
 - Password checks run in constant time.
 - `GET NUMLOGINS` and `LIST CLIENT` report the clients actually logged in.
 
-With no users configured, the server keeps its historical open behavior (any client accepted) and logs a warning at startup.
+Authentication is opt-in: with no users configured the server runs in open mode (any client accepted, its historical behavior), which is a perfectly fine choice on a trusted LAN. The startup log states which mode is active.
 
 ## Battery Runtime Prediction
 

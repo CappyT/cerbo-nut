@@ -118,7 +118,9 @@ func main() {
 		log.Println("Verbose mode ACTIVE: connection and debug logs enabled.")
 	}
 	if len(cfg.Users) == 0 {
-		log.Println("WARNING: no users configured, NUT authentication is disabled.")
+		log.Println("NUT authentication disabled (no users configured); add [[users]] to the config to enable it.")
+	} else {
+		log.Printf("NUT authentication enabled (%d user(s) configured).", len(cfg.Users))
 	}
 
 	// Restore the load model learned in previous runs
