@@ -3,6 +3,11 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "semver tag to create and release (e.g. v1.0.0)"
+        required: true
 
 permissions:
   contents: write
@@ -10,7 +15,14 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     steps:
+      - name: validate version
+        run: |
+          echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || { echo "'$VERSION' is not a valid semver tag (vX.Y.Z)"; exit 1; }
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
@@ -23,8 +35,8 @@ jobs:
           build() {
             GOOS="$1" GOARCH="$2" GOARM="$3" CGO_ENABLED=0 \
               go build -trimpath \
-                -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
-                -o "dist/cerbo-nut-${GITHUB_REF_NAME}-$4" .
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "dist/cerbo-nut-${VERSION}-$4" .
           }
           build linux arm   7  linux-armv7
           build linux arm64 "" linux-arm64
@@ -33,8 +45,11 @@ jobs:
       - name: checksums
         run: cd dist && sha256sum * > checksums.txt
 
+      # On workflow_dispatch the tag does not exist yet: the release creation
+      # also creates it, pointing at the commit this workflow ran on.
       - name: create github release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
           files: dist/*
           generate_release_notes: true
