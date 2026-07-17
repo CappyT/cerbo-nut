@@ -2,7 +2,10 @@ module nut-victron
 
 go 1.25.7
 
-require github.com/eclipse/paho.mqtt.golang v1.5.1
+require (
+	github.com/BurntSushi/toml v1.6.0
+	github.com/eclipse/paho.mqtt.golang v1.5.1
+)
 
 require (
 	github.com/gorilla/websocket v1.5.3 // indirect

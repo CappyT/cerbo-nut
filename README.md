@@ -12,6 +12,57 @@ This project provides a lightweight bridge between a Victron Energy system (via 
 ## Scope
 The server listens for MQTT messages from Venus OS and translates them into NUT variables. It emulates a `upsd` server, allowing any NUT client to query the state of the Victron system as if it were a physical UPS.
 
+## Configuration
+
+Everything is configured through a TOML file, with optional environment variable overrides. Resolution order is: **built-in defaults < config file < `CERBO_NUT_*` environment variables**. All values are optional — with no config file at all, the server runs with the same defaults the project has always had.
+
+- Default config path: `/data/cerbo-nut/config.toml` (missing file = defaults apply)
+- Override the path with `--config /path/to/config.toml` or `CERBO_NUT_CONFIG=/path/to/config.toml`
+- See [`config.example.toml`](config.example.toml) for the full annotated reference
+- Unknown keys in the config file are rejected at startup, so typos fail loudly instead of being silently ignored
+
+| Environment variable | Config key |
+|---|---|
+| `CERBO_NUT_LISTEN` | `server.listen` |
+| `CERBO_NUT_STATE_FILE` | `server.state_file` |
+| `CERBO_NUT_VERBOSE` | `server.verbose` |
+| `CERBO_NUT_MQTT_BROKER` | `mqtt.broker` |
+| `CERBO_NUT_MQTT_CLIENT_ID` | `mqtt.client_id` |
+| `CERBO_NUT_UPS_NAME` | `ups.name` |
+| `CERBO_NUT_UPS_DESCRIPTION` | `ups.description` |
+| `CERBO_NUT_DEVICE_MANUFACTURER` | `device.manufacturer` |
+| `CERBO_NUT_DEVICE_MODEL` | `device.model` |
+| `CERBO_NUT_DEVICE_SERIAL` | `device.serial` |
+| `CERBO_NUT_BATTERY_TYPE` | `device.battery_type` |
+| `CERBO_NUT_INVERTER_MAX_VA` | `power.inverter_max_va` |
+| `CERBO_NUT_BATTERY_CAPACITY_WH` | `power.battery_capacity_wh` |
+| `CERBO_NUT_BATTERY_CHARGE_LOW` | `thresholds.battery_charge_low` |
+| `CERBO_NUT_BATTERY_RUNTIME_LOW` | `thresholds.battery_runtime_low` |
+| `CERBO_NUT_LOW_BATTERY_SOC` | `thresholds.low_battery_soc` |
+| `CERBO_NUT_LOW_BATTERY_RUNTIME` | `thresholds.low_battery_runtime` |
+| `CERBO_NUT_GRID_LOST_VOLTAGE` | `thresholds.grid_lost_voltage` |
+| `CERBO_NUT_USERNAME` + `CERBO_NUT_PASSWORD` | adds (or overrides) one `[[users]]` account |
+
+## Authentication
+
+NUT authentication is enabled by adding one or more `[[users]]` blocks to the config (or setting `CERBO_NUT_USERNAME`/`CERBO_NUT_PASSWORD`):
+
+```toml
+[[users]]
+username = "upsuser"
+password = "changeme"
+```
+
+Behavior follows the NUT protocol (RFC 9271), matching what a real `upsd` does:
+
+- Read-only queries (`LIST`, `GET`) never require authentication.
+- `LOGIN`, `SET`, and `INSTCMD` require a valid `USERNAME` + `PASSWORD`, with the proper protocol errors (`USERNAME-REQUIRED`, `PASSWORD-REQUIRED`, `ACCESS-DENIED`, `ALREADY-SET-USERNAME`, `ALREADY-LOGGED-IN`, `UNKNOWN-UPS`, ...).
+- Quoted arguments are supported, so passwords may contain spaces (`PASSWORD "my secret"`).
+- Password checks run in constant time.
+- `GET NUMLOGINS` and `LIST CLIENT` report the clients actually logged in.
+
+With no users configured, the server keeps its historical open behavior (any client accepted) and logs a warning at startup.
+
 ## Battery Runtime Prediction
 
 The `battery.runtime` value is computed differently depending on the power source:
@@ -37,8 +88,8 @@ The `release` workflow then cross-compiles the binaries (stamping the version in
 
 ## Compilation
 
-> [!IMPORTANT]
-> Before compiling, open `main.go` and review the `CONFIGURATION BLOCK` at the top of the file. You should customize variables like `InverterMaxVA`, `BatteryCapacityWh`, and `DeviceModel` to match your specific hardware setup.
+> [!NOTE]
+> No source changes are needed to customize the server: hardware values like `inverter_max_va`, `battery_capacity_wh`, and `device.model` are set in the config file (see [Configuration](#configuration)).
 
 Since the Cerbo GX uses an ARM architecture (usually ARMv7), you need to cross-compile the binary if you are developing on a different architecture (like x86_64).
 
@@ -74,7 +125,10 @@ env GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w" -o cer
    chmod +x /data/cerbo-nut/cerbo-nut
    ```
 
-3. **Enable MQTT on Cerbo GX**:
+3. **Add the configuration (optional)**:
+   Copy [`config.example.toml`](config.example.toml) to `/data/cerbo-nut/config.toml` and adjust it to your hardware. Without it, the built-in defaults apply.
+
+4. **Enable MQTT on Cerbo GX**:
    Ensure that "MQTT on LAN (SSL)" or "MQTT on LAN (Plain)" is enabled in the Venus OS settings under **Settings -> Services**. This tool connects to the local broker at `127.0.0.1:1883`.
 
 ## Running as a Service (Persistence)
@@ -126,6 +180,6 @@ Configure your NUT client (e.g., Synology or another Linux box) to point to the 
 
 **Example `upsmon.conf` entry:**
 ```text
-MONITOR ups@<cerbo-ip> 1 upsuser upspass slave
+MONITOR ups@<cerbo-ip> 1 upsuser changeme slave
 ```
-*(Note: The server currently accepts any username/password for simplicity in internal networks).*
+The credentials must match a `[[users]]` account from the config file (see [Authentication](#authentication)). If no users are configured, any username/password is accepted.

@@ -1,0 +1,58 @@
+# cerbo-nut configuration
+#
+# Copy this file to /data/cerbo-nut/config.toml (the default path) or point to
+# it with --config / CERBO_NUT_CONFIG. Every value is optional: anything left
+# out falls back to the defaults shown here. CERBO_NUT_* environment variables
+# override values from this file (see the README for the full list).
+#
+# The battery runtime prediction has no settings on purpose: it calibrates
+# itself against real discharge data.
+
+[server]
+# TCP address the NUT server listens on.
+listen = "0.0.0.0:3493"
+# Where the self-learned load model is persisted. Empty string disables
+# persistence entirely.
+state_file = "/data/cerbo-nut/calibration.json"
+# Enable debug logging (same as the --verbose flag).
+verbose = false
+
+[mqtt]
+# The Venus OS MQTT broker. The default is correct when running on the Cerbo.
+broker = "tcp://127.0.0.1:1883"
+client_id = "nut-server-go"
+
+[ups]
+# UPS name announced over NUT ("ups" is what Synology/Home Assistant expect).
+name = "ups"
+description = "Victron System"
+
+[device]
+manufacturer = "Victron Energy"
+model = "MultiPlus 48/1600 (Cerbo GX)"
+serial = "CerboGX-MK2"
+battery_type = "Li-Ion"
+
+[power]
+# Inverter rating, used for the ups.load percentage.
+inverter_max_va = 1600.0
+# Fallback battery capacity, used only until the BMS reports the real one.
+battery_capacity_wh = 5120.0
+
+[thresholds]
+# Values exposed to NUT clients as battery.charge.low / battery.runtime.low.
+battery_charge_low = 20
+battery_runtime_low = 600
+# When on battery, the LB (low battery) status flag is raised below either of
+# these two limits.
+low_battery_soc = 20.0
+low_battery_runtime = 300.0
+# AC input voltage under which the grid is considered lost (OB status).
+grid_lost_voltage = 180.0
+
+# NUT authentication. Repeat the [[users]] block for each account. With no
+# users configured, authentication is disabled and any client is accepted.
+#
+# [[users]]
+# username = "upsuser"
+# password = "changeme"

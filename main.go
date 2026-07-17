@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,44 +17,20 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// --- CONFIGURATION BLOCK ---
-const (
-	// UPS Metadata
-	UpsName            = "ups"            // Standard name for compatibility (Synology/HA)
-	UpsDescription     = "Victron System" // Description shown in NUT clients
-	DeviceManufacturer = "Victron Energy"
-	DeviceModel        = "MultiPlus 48/1600 (Cerbo GX)"
-	DeviceSerial       = "CerboGX-MK2"
-
-	// Power & Battery Specs
-	InverterMaxVA     = 1600.0 // Max VA for calculating ups.load percentage
-	BatteryCapacityWh = 5120.0 // Default Wh if capacity cannot be discovered via MQTT
-	BatteryType       = "Li-Ion"
-
-	// Thresholds & Status
-	BatteryChargeLow     = "20"  // NUT variable (string) for low battery warning
-	BatteryRuntimeLow    = "600" // NUT variable (string) for low runtime warning (seconds)
-	LowBatterySocLimit   = 20.0  // Threshold for "LB" (Low Battery) status (%)
-	LowBatteryRunLimit   = 300.0 // Threshold for "LB" status (seconds)
-	GridLostVoltageLimit = 180.0 // Voltage below which we consider the grid lost (OB status)
-)
-
-// ---------------------------
-
 // --- INTERNAL MODEL CONSTANTS ---
 // The runtime prediction is self-calibrating: the AC->DC load model below is
 // only a prior that real discharge data progressively overrides. These are
 // algorithm constants, not tunables — there is nothing to configure here.
+// Everything meant to be configured lives in the config file (see config.go).
 const (
-	seedSlope       = 1.0 / 0.92           // Prior DC/AC slope (inverter conversion efficiency)
-	seedIdleWatts   = 12.0                 // Prior inverter idle overhead (W)
-	priorAnchorAC   = InverterMaxVA * 0.75 // AC power of the second prior anchor point (W)
-	priorWeight     = 120.0                // Weight of each prior anchor, in seconds of real data
-	learnForgetTau  = 6 * 3600.0           // Forgetting time constant of learned data (discharge seconds)
-	runtimeEmaTau   = 300.0                // Time constant (s) of the EMA feeding the runtime estimate
-	voltsEmaTau     = 6 * 3600.0           // Time constant (s) of the average battery voltage estimate
-	defaultSocFloor = 10.0                 // SoC reserve when ESS does not publish a minimum SoC limit (%)
-	modelSlopeMin   = 0.95                 // Sanity clamps for the learned model coefficients
+	seedSlope       = 1.0 / 0.92 // Prior DC/AC slope (inverter conversion efficiency)
+	seedIdleWatts   = 12.0       // Prior inverter idle overhead (W)
+	priorWeight     = 120.0      // Weight of each prior anchor, in seconds of real data
+	learnForgetTau  = 6 * 3600.0 // Forgetting time constant of learned data (discharge seconds)
+	runtimeEmaTau   = 300.0      // Time constant (s) of the EMA feeding the runtime estimate
+	voltsEmaTau     = 6 * 3600.0 // Time constant (s) of the average battery voltage estimate
+	defaultSocFloor = 10.0       // SoC reserve when ESS does not publish a minimum SoC limit (%)
+	modelSlopeMin   = 0.95       // Sanity clamps for the learned model coefficients
 	modelSlopeMax   = 1.8
 	modelIdleMin    = 0.0
 	modelIdleMax    = 100.0
@@ -65,11 +40,11 @@ const (
 // -ldflags "-X main.version=vX.Y.Z"
 var version = "dev"
 
-// Global variables for command line flags
-var (
-	verboseMode   bool
-	calibFilePath string
-)
+// cfg holds the resolved runtime configuration (defaults < file < env)
+var cfg *Config
+
+// verboseMode enables debug logging (--verbose flag or config)
+var verboseMode bool
 
 // VictronData contains real-time state read from MQTT
 type VictronData struct {
@@ -125,25 +100,37 @@ func debugLog(format string, v ...interface{}) {
 
 func main() {
 	// Command line parsing
-	flag.BoolVar(&verboseMode, "verbose", false, "Enable detailed logs (debug)")
-	flag.StringVar(&calibFilePath, "calib-file", "/data/cerbo-nut/calibration.json", "File where the learned load model is persisted (empty to disable)")
+	var verboseFlag bool
+	var configPath string
+	flag.BoolVar(&verboseFlag, "verbose", false, "Enable detailed logs (debug)")
+	flag.StringVar(&configPath, "config", "", "Path to the TOML config file (default "+DefaultConfigPath+", or $CERBO_NUT_CONFIG)")
 	flag.Parse()
+
+	var err error
+	cfg, err = loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
+	verboseMode = verboseFlag || cfg.Server.Verbose
 
 	log.Printf("Starting Victron-NUT Server for Cerbo GX (%s)...", version)
 	if verboseMode {
 		log.Println("Verbose mode ACTIVE: connection and debug logs enabled.")
 	}
+	if len(cfg.Users) == 0 {
+		log.Println("WARNING: no users configured, NUT authentication is disabled.")
+	}
 
 	// Restore the load model learned in previous runs
-	if calibFilePath != "" {
-		loadModel(calibFilePath)
-		go modelSaver(calibFilePath)
+	if cfg.Server.StateFile != "" {
+		loadModel(cfg.Server.StateFile)
+		go modelSaver(cfg.Server.StateFile)
 	}
 
 	// 1. MQTT Client Configuration (points to localhost if running on Cerbo)
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker("tcp://127.0.0.1:1883")
-	opts.SetClientID("nut-server-go")
+	opts.AddBroker(cfg.MQTT.Broker)
+	opts.SetClientID(cfg.MQTT.ClientID)
 	opts.SetCleanSession(true)
 	opts.SetAutoReconnect(true)
 	opts.SetDefaultPublishHandler(messageHandler)
@@ -175,12 +162,12 @@ func main() {
 	}()
 
 	// 3. Start NUT TCP Server
-	listener, err := net.Listen("tcp", "0.0.0.0:3493")
+	listener, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {
 		log.Fatalf("Error starting NUT TCP server: %v", err)
 	}
 	defer listener.Close()
-	log.Println("NUT Server listening on port 3493...")
+	log.Printf("NUT Server listening on %s...", cfg.Server.Listen)
 
 	// Graceful shutdown management
 	sigChan := make(chan os.Signal, 1)
@@ -191,8 +178,8 @@ func main() {
 		state.RLock()
 		dirty := state.ModelDirty
 		state.RUnlock()
-		if calibFilePath != "" && dirty {
-			if err := persistModel(calibFilePath); err != nil {
+		if cfg.Server.StateFile != "" && dirty {
+			if err := persistModel(cfg.Server.StateFile); err != nil {
 				log.Printf("Error saving model on shutdown: %v", err)
 			}
 		}
@@ -345,11 +332,14 @@ func learnLoadModelLocked(ac, dc, dt float64) {
 // flat load only pins the total draw at one operating point, and the prior
 // decides how to split the correction between slope and idle overhead.
 func solveLoadModelLocked() {
+	// Second prior anchor point sits at 75% of the inverter rating
+	anchorAC := cfg.Power.InverterMaxVA * 0.75
+
 	n := state.RegN + 2*priorWeight
-	sx := state.RegSx + priorWeight*priorAnchorAC
-	sy := state.RegSy + priorWeight*(2*seedIdleWatts+seedSlope*priorAnchorAC)
-	sxx := state.RegSxx + priorWeight*priorAnchorAC*priorAnchorAC
-	sxy := state.RegSxy + priorWeight*priorAnchorAC*(seedSlope*priorAnchorAC+seedIdleWatts)
+	sx := state.RegSx + priorWeight*anchorAC
+	sy := state.RegSy + priorWeight*(2*seedIdleWatts+seedSlope*anchorAC)
+	sxx := state.RegSxx + priorWeight*anchorAC*anchorAC
+	sxy := state.RegSxy + priorWeight*anchorAC*(seedSlope*anchorAC+seedIdleWatts)
 
 	det := n*sxx - sx*sx
 	if det <= 0 {
@@ -476,256 +466,4 @@ func getFloat(unk interface{}) (float64, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func generateNUTVars() map[string]string {
-	state.RLock()
-	defer state.RUnlock()
-
-	vars := make(map[string]string)
-
-	vars["driver.name"] = "dummy-victron"
-	vars["driver.version"] = version
-	vars["driver.version.internal"] = version
-	vars["driver.parameter.port"] = "mqtt"
-
-	vars["device.mfr"] = DeviceManufacturer
-	vars["device.model"] = DeviceModel
-	vars["device.type"] = "ups"
-	vars["device.serial"] = DeviceSerial
-	vars["ups.mfr"] = DeviceManufacturer
-	vars["ups.model"] = DeviceModel
-	vars["ups.serial"] = DeviceSerial
-
-	vars["battery.type"] = BatteryType
-	vars["battery.charge"] = fmt.Sprintf("%.1f", state.BatterySoc)
-	vars["battery.voltage"] = fmt.Sprintf("%.2f", state.BatteryVolts)
-	vars["battery.current"] = fmt.Sprintf("%.2f", state.BatteryAmps)
-	vars["battery.charge.low"] = BatteryChargeLow
-	vars["battery.runtime.low"] = BatteryRuntimeLow
-
-	// Victron's TimeToGo is only meaningful while actually discharging; on grid
-	// it is stale or absent, so there we rely on our own load-based estimate.
-	onBattery := state.GridLost || state.AcInVolts < GridLostVoltageLimit
-	var runtimeSeconds float64
-	if onBattery && state.BatteryTimeToGo > 0 {
-		runtimeSeconds = state.BatteryTimeToGo
-	} else {
-		calcWatts := state.RuntimeWatts
-		if calcWatts < 1 {
-			calcWatts = 1 // Div-by-zero guard; the real floor is the learned idle draw
-		}
-
-		capacityWh := BatteryCapacityWh
-		if state.BatteryCapacityAh > 0 && state.AvgBatteryVolts > 0 {
-			capacityWh = state.BatteryCapacityAh * state.AvgBatteryVolts
-		}
-
-		// Unusable reserve: the ESS minimum SoC limit when the system publishes
-		// one, a conservative default otherwise
-		socFloor := defaultSocFloor
-		if state.SocFloorMin >= 0 {
-			socFloor = state.SocFloorMin
-		}
-		usableSoc := state.BatterySoc - socFloor
-		if usableSoc < 0 {
-			usableSoc = 0
-		}
-
-		remainingWh := capacityWh * (usableSoc / 100.0)
-		runtimeSeconds = (remainingWh / calcWatts) * 3600.0
-	}
-	// Report in whole minutes: sub-minute jitter carries no information for NUT
-	// clients and only adds noise to history graphs.
-	runtimeSeconds = math.Round(runtimeSeconds/60.0) * 60.0
-	vars["battery.runtime"] = fmt.Sprintf("%.0f", runtimeSeconds)
-
-	vars["ups.status"] = generateStatus(runtimeSeconds)
-
-	vars["input.voltage"] = fmt.Sprintf("%.1f", state.AcInVolts)
-	vars["input.current"] = fmt.Sprintf("%.2f", state.AcInAmps)
-
-	vars["output.voltage"] = fmt.Sprintf("%.1f", state.AcOutVolts)
-	vars["output.frequency"] = fmt.Sprintf("%.2f", state.AcOutFreq)
-	vars["output.current"] = fmt.Sprintf("%.2f", state.AcOutAmps)
-
-	loadPercent := (state.AcOutWatts / InverterMaxVA) * 100
-	if loadPercent > 100 {
-		loadPercent = 100
-	}
-	vars["ups.load"] = fmt.Sprintf("%.1f", loadPercent)
-	vars["ups.realpower"] = fmt.Sprintf("%.0f", state.AcOutWatts)
-	vars["ups.power"] = fmt.Sprintf("%.0f", state.AcOutVA)
-
-	return vars
-}
-
-func generateStatus(runtimeSeconds float64) string {
-	status := "OL"
-
-	if state.GridLost || state.AcInVolts < GridLostVoltageLimit {
-		status = "OB"
-	}
-
-	if state.BatteryAmps > 1.0 {
-		status = "OL CHRG"
-	} else if state.BatteryAmps < -1.0 {
-		status += " DISCHRG"
-	}
-
-	if strings.Contains(status, "OB") {
-		if state.BatterySoc <= LowBatterySocLimit || runtimeSeconds <= LowBatteryRunLimit {
-			status += " LB"
-		}
-	}
-
-	return status
-}
-
-func handleNUTConnection(conn net.Conn) {
-	defer conn.Close()
-	scanner := bufio.NewScanner(conn)
-	writer := bufio.NewWriter(conn)
-
-	remoteAddr := conn.RemoteAddr().String()
-	debugLog("[NUT] New connection from %s", remoteAddr)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		debugLog("[NUT Client %s] -> %s", remoteAddr, line)
-
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue
-		}
-		command := strings.ToUpper(parts[0])
-
-		reqUpsName := UpsName
-		if len(parts) > 2 {
-			reqUpsName = parts[2]
-		}
-
-		isMyUps := true
-
-		switch command {
-		case "HELP":
-			resp := "BEGIN HELP\nHELP\nVER\nNETVER\nLIST\nGET\nSET\nLOGIN\nLOGOUT\nUSERNAME\nPASSWORD\nSTARTTLS\nEND HELP\n"
-			debugLog("[NUT Server] <- BEGIN/END HELP")
-			writer.WriteString(resp)
-
-		case "VER":
-			resp := "Network UPS Tools upsd 2.8.0\n"
-			debugLog("[NUT Server] <- %q", resp)
-			writer.WriteString(resp)
-
-		case "NETVER":
-			resp := "1.2\n"
-			debugLog("[NUT Server] <- %q", resp)
-			writer.WriteString(resp)
-
-		case "STARTTLS":
-			resp := "ERR FEATURE-NOT-SUPPORTED\n"
-			debugLog("[NUT Server] <- %q", resp)
-			writer.WriteString(resp)
-
-		case "TRACKING":
-			writer.WriteString("OK\n")
-
-		case "LIST":
-			if len(parts) >= 2 && strings.ToUpper(parts[1]) == "UPS" {
-				resp := fmt.Sprintf("BEGIN LIST UPS\nUPS %s \"%s\"\nEND LIST UPS\n", UpsName, UpsDescription)
-				debugLog("[NUT Server] <- %q", resp)
-				writer.WriteString(resp)
-			} else if len(parts) >= 3 && strings.ToUpper(parts[1]) == "VAR" && isMyUps {
-				writer.WriteString(fmt.Sprintf("BEGIN LIST VAR %s\n", reqUpsName))
-				for k, v := range generateNUTVars() {
-					writer.WriteString(fmt.Sprintf("VAR %s %s \"%s\"\n", reqUpsName, k, v))
-				}
-				writer.WriteString(fmt.Sprintf("END LIST VAR %s\n", reqUpsName))
-				debugLog("[NUT Server] <- Full VAR list sent")
-			} else if len(parts) >= 3 && strings.ToUpper(parts[1]) == "RW" && isMyUps {
-				resp := fmt.Sprintf("BEGIN LIST RW %s\nEND LIST RW %s\n", reqUpsName, reqUpsName)
-				debugLog("[NUT Server] <- %q", resp)
-				writer.WriteString(resp)
-			} else if len(parts) >= 3 && strings.ToUpper(parts[1]) == "CMD" && isMyUps {
-				resp := fmt.Sprintf("BEGIN LIST CMD %s\nEND LIST CMD %s\n", reqUpsName, reqUpsName)
-				debugLog("[NUT Server] <- %q", resp)
-				writer.WriteString(resp)
-			} else if len(parts) >= 3 && strings.ToUpper(parts[1]) == "CLIENT" && isMyUps {
-				resp := fmt.Sprintf("BEGIN LIST CLIENT %s\nCLIENT %s %s\nEND LIST CLIENT %s\n", reqUpsName, reqUpsName, remoteAddr, reqUpsName)
-				debugLog("[NUT Server] <- CLIENT list sent")
-				writer.WriteString(resp)
-			} else {
-				debugLog("[NUT Server] <- ERR INVALID-ARGUMENT")
-				writer.WriteString("ERR INVALID-ARGUMENT\n")
-			}
-
-		case "GET":
-			if len(parts) >= 2 {
-				subCmd := strings.ToUpper(parts[1])
-				if subCmd == "VAR" && len(parts) == 4 && isMyUps {
-					vars := generateNUTVars()
-					if val, ok := vars[parts[3]]; ok {
-						resp := fmt.Sprintf("VAR %s %s \"%s\"\n", reqUpsName, parts[3], val)
-						debugLog("[NUT Server] <- %q", resp)
-						writer.WriteString(resp)
-					} else {
-						debugLog("[NUT Server] <- ERR VAR-NOT-SUPPORTED (%s)", parts[3])
-						writer.WriteString("ERR VAR-NOT-SUPPORTED\n")
-					}
-				} else if subCmd == "UPSDESC" && len(parts) == 3 && isMyUps {
-					resp := fmt.Sprintf("UPSDESC %s \"%s\"\n", reqUpsName, UpsDescription)
-					debugLog("[NUT Server] <- %q", resp)
-					writer.WriteString(resp)
-				} else if subCmd == "DESC" && len(parts) == 4 && isMyUps {
-					resp := fmt.Sprintf("DESC %s %s \"Generic Description\"\n", reqUpsName, parts[3])
-					debugLog("[NUT Server] <- %q", resp)
-					writer.WriteString(resp)
-				} else if subCmd == "TYPE" && len(parts) == 4 && isMyUps {
-					resp := fmt.Sprintf("TYPE %s %s STRING\n", reqUpsName, parts[3])
-					debugLog("[NUT Server] <- %q", resp)
-					writer.WriteString(resp)
-				} else if subCmd == "CMDDESC" && len(parts) == 4 && isMyUps {
-					resp := fmt.Sprintf("CMDDESC %s %s \"Command description\"\n", reqUpsName, parts[3])
-					debugLog("[NUT Server] <- %q", resp)
-					writer.WriteString(resp)
-				} else if subCmd == "NUMLOGINS" && len(parts) == 3 && isMyUps {
-					resp := fmt.Sprintf("NUMLOGINS %s 1\n", reqUpsName)
-					debugLog("[NUT Server] <- %q", resp)
-					writer.WriteString(resp)
-				} else {
-					debugLog("[NUT Server] <- ERR INVALID-ARGUMENT")
-					writer.WriteString("ERR INVALID-ARGUMENT\n")
-				}
-			} else {
-				debugLog("[NUT Server] <- ERR INVALID-ARGUMENT")
-				writer.WriteString("ERR INVALID-ARGUMENT\n")
-			}
-
-		case "LOGOUT":
-			debugLog("[NUT Server] <- OK Goodbye")
-			writer.WriteString("OK Goodbye\n")
-			writer.Flush()
-			return
-
-		case "USERNAME", "PASSWORD", "LOGIN", "SET":
-			debugLog("[NUT Server] <- OK")
-			writer.WriteString("OK\n")
-
-		default:
-			debugLog("[NUT Server] <- ERR UNKNOWN-COMMAND")
-			writer.WriteString("ERR UNKNOWN-COMMAND\n")
-		}
-
-		writer.Flush()
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[NUT] Error reading from %s: %v", remoteAddr, err) // Net error log remains
-	}
-	debugLog("[NUT] Connection closed by %s", remoteAddr)
 }
