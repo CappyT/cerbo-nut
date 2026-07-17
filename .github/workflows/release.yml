@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    branches: ["release/v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -15,13 +16,20 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
     steps:
-      - name: validate version
+      # The version comes from the tag name, the dispatch input, or a
+      # release/vX.Y.Z branch name. In the last two cases the tag does not
+      # exist yet and is created by the release step below.
+      - name: resolve version
         run: |
-          echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
-            || { echo "'$VERSION' is not a valid semver tag (vX.Y.Z)"; exit 1; }
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#release/}"
+          fi
+          echo "$V" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || { echo "'$V' is not a valid semver tag (vX.Y.Z)"; exit 1; }
+          echo "VERSION=$V" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
 
