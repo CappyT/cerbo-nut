@@ -42,6 +42,7 @@ Everything is configured through a TOML file, with optional environment variable
 | `CERBO_NUT_LOW_BATTERY_RUNTIME` | `thresholds.low_battery_runtime` |
 | `CERBO_NUT_GRID_LOST_VOLTAGE` | `thresholds.grid_lost_voltage` |
 | `CERBO_NUT_USERNAME` + `CERBO_NUT_PASSWORD` | adds (or overrides) one `[[users]]` account |
+| `CERBO_NUT_ALLOWED_NETWORKS` | comma-separated `allowed_networks` for the env-defined account |
 
 ## Authentication
 
@@ -49,8 +50,13 @@ NUT authentication is enabled by adding one or more `[[users]]` blocks to the co
 
 ```toml
 [[users]]
-username = "upsuser"
+username = "synology"
 password = "changeme"
+allowed_networks = ["192.168.1.0/24"]  # optional per-user ACL
+
+[[users]]
+username = "homeassistant"
+password = "changeme-too"              # no ACL: valid from anywhere
 ```
 
 Behavior follows the NUT protocol (RFC 9271), matching what a real `upsd` does:
@@ -60,6 +66,7 @@ Behavior follows the NUT protocol (RFC 9271), matching what a real `upsd` does:
 - Quoted arguments are supported, so passwords may contain spaces (`PASSWORD "my secret"`).
 - Password checks run in constant time.
 - `GET NUMLOGINS` and `LIST CLIENT` report the clients actually logged in.
+- **Per-user network ACL**: `allowed_networks` limits an account to a list of CIDR ranges or bare IPs (IPv4 and IPv6). Authenticating from outside the list fails with the same `ACCESS-DENIED` as a wrong password, so probing reveals nothing. Accounts without the key work from anywhere.
 
 Authentication is opt-in: with no users configured the server runs in open mode (any client accepted, its historical behavior), which is a perfectly fine choice on a trusted LAN. The startup log states which mode is active.
 

@@ -53,6 +53,14 @@ grid_lost_voltage = 180.0
 # NUT authentication. Repeat the [[users]] block for each account. With no
 # users configured, authentication is disabled and any client is accepted.
 #
+# allowed_networks optionally restricts where an account may authenticate
+# from (CIDR ranges or bare IPs). Omit it for no restriction.
+#
 # [[users]]
-# username = "upsuser"
+# username = "synology"
 # password = "changeme"
+# allowed_networks = ["192.168.1.0/24"]
+#
+# [[users]]
+# username = "homeassistant"
+# password = "changeme-too"

@@ -49,13 +49,16 @@ func loggedInClients() []string {
 }
 
 // credentialsValid checks a username/password pair against the configured
-// users in constant time.
-func credentialsValid(user, pass string) bool {
+// users in constant time. Accounts restricted with allowed_networks only
+// match when the connection originates from one of their networks; the
+// failure is indistinguishable from a wrong password on purpose.
+func credentialsValid(user, pass, remoteAddr string) bool {
 	valid := false
-	for _, u := range cfg.Users {
+	for i := range cfg.Users {
+		u := &cfg.Users[i]
 		userOk := subtle.ConstantTimeCompare([]byte(u.Username), []byte(user)) == 1
 		passOk := subtle.ConstantTimeCompare([]byte(u.Password), []byte(pass)) == 1
-		if userOk && passOk {
+		if userOk && passOk && u.ipAllowed(remoteAddr) {
 			valid = true
 		}
 	}
@@ -75,7 +78,7 @@ func (s *session) authErr() string {
 	if s.password == "" {
 		return "ERR PASSWORD-REQUIRED\n"
 	}
-	if !credentialsValid(s.username, s.password) {
+	if !credentialsValid(s.username, s.password, s.remoteAddr) {
 		return "ERR ACCESS-DENIED\n"
 	}
 	return ""

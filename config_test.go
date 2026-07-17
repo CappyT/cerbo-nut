@@ -94,3 +94,29 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRejectsBadNetworks(t *testing.T) {
+	c := defaultConfig()
+	c.Users = []UserConfig{{Username: "a", Password: "x", AllowedNetworks: []string{"not-a-network"}}}
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "allowed_networks") {
+		t.Fatalf("expected allowed_networks error, got: %v", err)
+	}
+}
+
+func TestEnvUserWithNetworks(t *testing.T) {
+	t.Setenv("CERBO_NUT_CONFIG", "")
+	t.Setenv("CERBO_NUT_USERNAME", "envuser")
+	t.Setenv("CERBO_NUT_PASSWORD", "envpass")
+	t.Setenv("CERBO_NUT_ALLOWED_NETWORKS", "192.168.1.0/24, 10.0.0.1")
+
+	c, err := loadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(c.Users) != 1 || len(c.Users[0].AllowedNetworks) != 2 {
+		t.Fatalf("env user networks not applied: %+v", c.Users)
+	}
+	if !c.Users[0].ipAllowed("192.168.1.9:1") || c.Users[0].ipAllowed("172.16.0.1:1") {
+		t.Fatal("env-configured networks not enforced")
+	}
+}

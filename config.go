@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -63,6 +65,37 @@ type Config struct {
 type UserConfig struct {
 	Username string `toml:"username"`
 	Password string `toml:"password"`
+	// AllowedNetworks restricts where this account may authenticate from.
+	// Entries are CIDR ranges ("192.168.1.0/24") or bare IPs ("192.168.1.5").
+	// Empty means no restriction: the account works from any source address.
+	AllowedNetworks []string `toml:"allowed_networks"`
+
+	// prefixes holds the parsed AllowedNetworks, filled by validate()
+	prefixes []netip.Prefix
+}
+
+// ipAllowed reports whether this account may authenticate from remoteAddr
+// ("host:port" or a bare host). No configured networks means always allowed;
+// with networks configured, an unparsable source address is denied.
+func (u *UserConfig) ipAllowed(remoteAddr string) bool {
+	if len(u.prefixes) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap() // normalize ::ffff:a.b.c.d to plain IPv4
+	for _, p := range u.prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultConfig returns the built-in defaults, matching the values this
@@ -182,28 +215,63 @@ func (c *Config) applyEnv() error {
 
 	// CERBO_NUT_USERNAME/PASSWORD add one account (or override the account
 	// with the same username), handy for container-style deployments.
+	// CERBO_NUT_ALLOWED_NETWORKS (comma-separated CIDRs/IPs) optionally
+	// restricts that same account; when unset, a file-defined account keeps
+	// its own allowed_networks.
 	envUser, hasUser := os.LookupEnv("CERBO_NUT_USERNAME")
 	envPass, hasPass := os.LookupEnv("CERBO_NUT_PASSWORD")
+	envNets, hasNets := os.LookupEnv("CERBO_NUT_ALLOWED_NETWORKS")
 	if hasUser != hasPass {
 		errs = append(errs, "CERBO_NUT_USERNAME and CERBO_NUT_PASSWORD must be set together")
 	} else if hasUser {
+		var networks []string
+		if hasNets {
+			for _, n := range strings.Split(envNets, ",") {
+				if n = strings.TrimSpace(n); n != "" {
+					networks = append(networks, n)
+				}
+			}
+		}
 		replaced := false
 		for i := range c.Users {
 			if c.Users[i].Username == envUser {
 				c.Users[i].Password = envPass
+				if hasNets {
+					c.Users[i].AllowedNetworks = networks
+				}
 				replaced = true
 				break
 			}
 		}
 		if !replaced {
-			c.Users = append(c.Users, UserConfig{Username: envUser, Password: envPass})
+			c.Users = append(c.Users, UserConfig{Username: envUser, Password: envPass, AllowedNetworks: networks})
 		}
+	} else if hasNets {
+		errs = append(errs, "CERBO_NUT_ALLOWED_NETWORKS requires CERBO_NUT_USERNAME and CERBO_NUT_PASSWORD")
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid environment overrides: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// parseNetwork parses a CIDR range or a bare IP (treated as a /32 or /128).
+func parseNetwork(entry string) (netip.Prefix, error) {
+	s := strings.TrimSpace(entry)
+	if !strings.Contains(s, "/") {
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("%q is not a valid IP or CIDR", entry)
+		}
+		addr = addr.Unmap()
+		return netip.PrefixFrom(addr, addr.BitLen()), nil
+	}
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q is not a valid CIDR range", entry)
+	}
+	return p.Masked(), nil
 }
 
 // validate rejects configurations that cannot work.
@@ -241,6 +309,16 @@ func (c *Config) validate() error {
 		}
 		if u.Password == "" {
 			errs = append(errs, fmt.Sprintf("users[%d].password must not be empty", i))
+		}
+
+		c.Users[i].prefixes = nil
+		for _, entry := range u.AllowedNetworks {
+			p, err := parseNetwork(entry)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("users[%d].allowed_networks: %v", i, err))
+				continue
+			}
+			c.Users[i].prefixes = append(c.Users[i].prefixes, p)
 		}
 	}
 

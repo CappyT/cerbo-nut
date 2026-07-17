@@ -144,3 +144,54 @@ func TestUnknownUpsAndReadOnlyAccess(t *testing.T) {
 		t.Fatalf("unknown command: %s", got)
 	}
 }
+
+func TestPerUserNetworkACL(t *testing.T) {
+	cfg = defaultConfig()
+	cfg.Users = []UserConfig{
+		{Username: "lan", Password: "pw", AllowedNetworks: []string{"192.168.1.0/24", "10.0.0.5"}},
+		{Username: "anywhere", Password: "pw"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	cases := []struct {
+		user, addr string
+		want       bool
+	}{
+		{"lan", "192.168.1.42:50123", true},
+		{"lan", "192.168.2.42:50123", false},    // outside CIDR
+		{"lan", "10.0.0.5:1", true},             // bare IP entry
+		{"lan", "10.0.0.6:1", false},            // neighbor of bare IP
+		{"lan", "[::ffff:192.168.1.9]:5", true}, // IPv4-mapped IPv6
+		{"lan", "pipe", false},                  // unparsable source
+		{"anywhere", "203.0.113.7:9", true},     // unrestricted account
+		{"anywhere", "pipe", true},              // unrestricted, weird addr
+	}
+	for _, c := range cases {
+		if got := credentialsValid(c.user, "pw", c.addr); got != c.want {
+			t.Errorf("credentialsValid(%s from %s) = %v, want %v", c.user, c.addr, got, c.want)
+		}
+	}
+
+	// Wrong password never passes, even from an allowed network
+	if credentialsValid("lan", "wrong", "192.168.1.42:50123") {
+		t.Error("wrong password accepted")
+	}
+}
+
+func TestNetworkACLEndToEnd(t *testing.T) {
+	cfg = defaultConfig()
+	cfg.Users = []UserConfig{{Username: "lan", Password: "pw", AllowedNetworks: []string{"192.168.1.0/24"}}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	// net.Pipe has no source IP, so a restricted account must be denied
+	send := nutSession(t)
+	send("USERNAME lan")
+	send("PASSWORD pw")
+	if got := send("LOGIN ups"); got != "ERR ACCESS-DENIED" {
+		t.Fatalf("restricted user from unknown source: %s", got)
+	}
+}
