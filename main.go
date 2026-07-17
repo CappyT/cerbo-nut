@@ -53,8 +53,11 @@ const (
 
 // ---------------------------
 
-// Global variable for verbose mode
-var verboseMode bool
+// Global variables for command line flags
+var (
+	verboseMode   bool
+	calibFilePath string
+)
 
 // VictronData contains real-time state read from MQTT
 type VictronData struct {
@@ -98,13 +101,20 @@ func debugLog(format string, v ...interface{}) {
 }
 
 func main() {
-	// Command line parsing for --verbose flag
+	// Command line parsing
 	flag.BoolVar(&verboseMode, "verbose", false, "Enable detailed logs (debug)")
+	flag.StringVar(&calibFilePath, "calib-file", "/data/cerbo-nut/calibration.json", "File where the learned load calibration factor is persisted (empty to disable)")
 	flag.Parse()
 
 	log.Println("Starting Victron-NUT Server for Cerbo GX...")
 	if verboseMode {
 		log.Println("Verbose mode ACTIVE: connection and debug logs enabled.")
+	}
+
+	// Restore the calibration factor learned in previous runs
+	if calibFilePath != "" {
+		loadCalibration(calibFilePath)
+		go calibrationSaver(calibFilePath)
 	}
 
 	// 1. MQTT Client Configuration (points to localhost if running on Cerbo)
@@ -155,6 +165,11 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Closing server...")
+		if calibFilePath != "" {
+			if err := persistCalibration(calibFilePath); err != nil {
+				log.Printf("Error saving calibration on shutdown: %v", err)
+			}
+		}
 		client.Disconnect(250)
 		os.Exit(0)
 	}()
@@ -294,6 +309,77 @@ func updatePowerEstimateLocked(now time.Time) {
 func emaStep(prev, sample, dt, tau float64) float64 {
 	alpha := 1.0 - math.Exp(-dt/tau)
 	return prev + alpha*(sample-prev)
+}
+
+// calibrationFile is the on-disk format of the persisted calibration state
+type calibrationFile struct {
+	LoadCalib float64 `json:"load_calib"`
+}
+
+// loadCalibration restores the learned calibration factor from a previous run.
+// A missing file is normal on first start and is silently ignored.
+func loadCalibration(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		debugLog("No calibration file loaded (%v), starting neutral", err)
+		return
+	}
+	var cf calibrationFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		log.Printf("Calibration file %s is corrupted, ignoring: %v", path, err)
+		return
+	}
+	if cf.LoadCalib < CalibMin || cf.LoadCalib > CalibMax {
+		log.Printf("Calibration value %.3f in %s out of range, ignoring", cf.LoadCalib, path)
+		return
+	}
+	state.Lock()
+	state.LoadCalib = cf.LoadCalib
+	state.Unlock()
+	log.Printf("Restored load calibration factor %.3f from %s", cf.LoadCalib, path)
+}
+
+// persistCalibration atomically writes the current calibration factor to disk
+func persistCalibration(path string) error {
+	state.RLock()
+	cf := calibrationFile{LoadCalib: state.LoadCalib}
+	state.RUnlock()
+
+	data, err := json.Marshal(cf)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// calibrationSaver periodically persists the calibration factor, but only when
+// it has actually drifted, to avoid wearing the Cerbo's flash storage.
+func calibrationSaver(path string) {
+	state.RLock()
+	lastSaved := state.LoadCalib
+	state.RUnlock()
+
+	for {
+		time.Sleep(5 * time.Minute)
+
+		state.RLock()
+		current := state.LoadCalib
+		state.RUnlock()
+
+		if math.Abs(current-lastSaved) < 0.005 {
+			continue
+		}
+		if err := persistCalibration(path); err != nil {
+			log.Printf("Error saving calibration to %s: %v", path, err)
+			continue
+		}
+		lastSaved = current
+		debugLog("Calibration factor %.3f persisted to %s", current, path)
+	}
 }
 
 func getFloat(unk interface{}) (float64, bool) {

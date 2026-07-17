@@ -19,6 +19,7 @@ The `battery.runtime` value is computed differently depending on the power sourc
 - **On battery**: Victron's own `TimeToGo` (computed by the BMS from the real discharge) is used directly. On grid this value is stale or absent, so it is ignored there.
 - **On grid**: the runtime is estimated from the AC load using a small power model — `DC watts = InverterIdleWatts + AC watts / InverterEfficiency` — smoothed with a time-based exponential moving average (`RuntimeEmaTau`, default 5 minutes) so short appliance spikes don't make the prediction bounce.
 - **Self-calibration**: whenever the system actually discharges, the measured DC power from the battery meter is compared against the model, and a correction factor is learned over time (`CalibEmaTau`). Estimates made while on grid therefore converge toward what really happens during an outage.
+- **Persistence**: the learned calibration factor is saved to `/data/cerbo-nut/calibration.json` (configurable via `--calib-file`, empty string disables it) so it survives restarts and firmware updates. Writes are atomic and only happen when the value actually drifts (checked every 5 minutes), to avoid wearing the flash storage.
 
 The relevant tuning knobs (`InverterEfficiency`, `InverterIdleWatts`, `SocReservePercent`, `RuntimeEmaTau`, ...) live in the `CONFIGURATION BLOCK` at the top of `main.go`.
 
