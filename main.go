@@ -21,8 +21,8 @@ import (
 // --- CONFIGURATION BLOCK ---
 const (
 	// UPS Metadata
-	UpsName            = "ups"                        // Standard name for compatibility (Synology/HA)
-	UpsDescription     = "Victron System"             // Description shown in NUT clients
+	UpsName            = "ups"            // Standard name for compatibility (Synology/HA)
+	UpsDescription     = "Victron System" // Description shown in NUT clients
 	DeviceManufacturer = "Victron Energy"
 	DeviceModel        = "MultiPlus 48/1600 (Cerbo GX)"
 	DeviceSerial       = "CerboGX-MK2"
@@ -30,18 +30,7 @@ const (
 	// Power & Battery Specs
 	InverterMaxVA     = 1600.0 // Max VA for calculating ups.load percentage
 	BatteryCapacityWh = 5120.0 // Default Wh if capacity cannot be discovered via MQTT
-	BatteryNominalV   = 51.2   // Nominal battery voltage, used to convert discovered Ah to Wh
 	BatteryType       = "Li-Ion"
-
-	// Runtime Prediction Model
-	InverterEfficiency = 0.92  // AC->DC conversion efficiency of the inverter
-	InverterIdleWatts  = 12.0  // Constant DC overhead of the inverter while inverting (W)
-	SocReservePercent  = 10.0  // SoC kept as unusable reserve when estimating runtime (%)
-	MinCalcWatts       = 50.0  // Floor for the load used in the estimate, avoids absurd runtimes
-	RuntimeEmaTau      = 300.0 // Time constant (s) of the slow EMA feeding the runtime estimate
-	CalibEmaTau        = 600.0 // Time constant (s) of the learned AC->DC calibration factor
-	CalibMin           = 0.6   // Clamp for the learned calibration factor
-	CalibMax           = 1.8   // Clamp for the learned calibration factor
 
 	// Thresholds & Status
 	BatteryChargeLow     = "20"  // NUT variable (string) for low battery warning
@@ -52,6 +41,25 @@ const (
 )
 
 // ---------------------------
+
+// --- INTERNAL MODEL CONSTANTS ---
+// The runtime prediction is self-calibrating: the AC->DC load model below is
+// only a prior that real discharge data progressively overrides. These are
+// algorithm constants, not tunables — there is nothing to configure here.
+const (
+	seedSlope       = 1.0 / 0.92           // Prior DC/AC slope (inverter conversion efficiency)
+	seedIdleWatts   = 12.0                 // Prior inverter idle overhead (W)
+	priorAnchorAC   = InverterMaxVA * 0.75 // AC power of the second prior anchor point (W)
+	priorWeight     = 120.0                // Weight of each prior anchor, in seconds of real data
+	learnForgetTau  = 6 * 3600.0           // Forgetting time constant of learned data (discharge seconds)
+	runtimeEmaTau   = 300.0                // Time constant (s) of the EMA feeding the runtime estimate
+	voltsEmaTau     = 6 * 3600.0           // Time constant (s) of the average battery voltage estimate
+	defaultSocFloor = 10.0                 // SoC reserve when ESS does not publish a minimum SoC limit (%)
+	modelSlopeMin   = 0.95                 // Sanity clamps for the learned model coefficients
+	modelSlopeMax   = 1.8
+	modelIdleMin    = 0.0
+	modelIdleMax    = 100.0
+)
 
 // Global variables for command line flags
 var (
@@ -76,16 +84,27 @@ type VictronData struct {
 	AcOutWatts        float64
 	AcOutVA           float64   // Apparent power (VA)
 	RuntimeWatts      float64   // Slow EMA of the DC-equivalent draw, feeds the runtime estimate
-	LoadCalib         float64   // Learned measured/modeled DC power ratio, updated while discharging
+	AvgBatteryVolts   float64   // Slow EMA of measured battery voltage, converts discovered Ah to Wh
+	SocFloorMin       float64   // ESS minimum SoC limit discovered via MQTT, <0 = not published
 	LastPowerSample   time.Time // Timestamp of the last power sample, for time-based EMA
 	PortalID          string    // Extracted dynamically from the first MQTT message
+
+	// Learned AC->DC load model: DC watts = ModelA*AC + ModelB. The coefficients
+	// come from a decayed least-squares fit of (AC, measured DC) pairs collected
+	// while discharging, regularized toward a prior so the fit stays sane even
+	// when the observed load never varies.
+	ModelA, ModelB                     float64
+	RegN, RegSx, RegSy, RegSxx, RegSxy float64
+	ModelDirty                         bool // Learned data not yet persisted to disk
 }
 
 var state = &VictronData{
-	AcInVolts:  230.0, // Initialize to 230V to avoid false 'OB' status at app startup
-	AcOutVolts: 230.0, // Initialize to 230V by default
-	AcOutFreq:  50.0,  // Initialize to 50Hz by default
-	LoadCalib:  1.0,   // Start with a neutral calibration until a real discharge is observed
+	AcInVolts:   230.0, // Initialize to 230V to avoid false 'OB' status at app startup
+	AcOutVolts:  230.0, // Initialize to 230V by default
+	AcOutFreq:   50.0,  // Initialize to 50Hz by default
+	SocFloorMin: -1.0,  // Unknown until (and unless) ESS publishes it
+	ModelA:      seedSlope,
+	ModelB:      seedIdleWatts,
 }
 
 // VictronPayload is the standard JSON structure used by Venus OS on MQTT
@@ -103,7 +122,7 @@ func debugLog(format string, v ...interface{}) {
 func main() {
 	// Command line parsing
 	flag.BoolVar(&verboseMode, "verbose", false, "Enable detailed logs (debug)")
-	flag.StringVar(&calibFilePath, "calib-file", "/data/cerbo-nut/calibration.json", "File where the learned load calibration factor is persisted (empty to disable)")
+	flag.StringVar(&calibFilePath, "calib-file", "/data/cerbo-nut/calibration.json", "File where the learned load model is persisted (empty to disable)")
 	flag.Parse()
 
 	log.Println("Starting Victron-NUT Server for Cerbo GX...")
@@ -111,10 +130,10 @@ func main() {
 		log.Println("Verbose mode ACTIVE: connection and debug logs enabled.")
 	}
 
-	// Restore the calibration factor learned in previous runs
+	// Restore the load model learned in previous runs
 	if calibFilePath != "" {
-		loadCalibration(calibFilePath)
-		go calibrationSaver(calibFilePath)
+		loadModel(calibFilePath)
+		go modelSaver(calibFilePath)
 	}
 
 	// 1. MQTT Client Configuration (points to localhost if running on Cerbo)
@@ -165,9 +184,12 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Closing server...")
-		if calibFilePath != "" {
-			if err := persistCalibration(calibFilePath); err != nil {
-				log.Printf("Error saving calibration on shutdown: %v", err)
+		state.RLock()
+		dirty := state.ModelDirty
+		state.RUnlock()
+		if calibFilePath != "" && dirty {
+			if err := persistModel(calibFilePath); err != nil {
+				log.Printf("Error saving model on shutdown: %v", err)
 			}
 		}
 		client.Disconnect(250)
@@ -227,6 +249,17 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 		state.BatterySoc = valFloat
 	} else if strings.HasSuffix(topic, "/Dc/Battery/Voltage") {
 		state.BatteryVolts = valFloat
+		// Long-horizon average voltage: converts discovered Ah capacity to Wh
+		// without hardcoding the system's nominal voltage (12/24/48V all work)
+		if valFloat > 0 {
+			if state.AvgBatteryVolts == 0 {
+				state.AvgBatteryVolts = valFloat
+			} else {
+				state.AvgBatteryVolts = emaStep(state.AvgBatteryVolts, valFloat, 1.0, voltsEmaTau)
+			}
+		}
+	} else if strings.HasSuffix(topic, "/Settings/CGwacs/BatteryLife/MinimumSocLimit") {
+		state.SocFloorMin = valFloat
 	} else if strings.HasSuffix(topic, "/Dc/Battery/Current") {
 		state.BatteryAmps = valFloat
 	} else if strings.HasSuffix(topic, "/Dc/Battery/TimeToGo") {
@@ -256,11 +289,10 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 // updatePowerEstimateLocked refreshes the DC-equivalent power estimate used for
 // the runtime prediction. Must be called with state.Lock held.
 //
-// The estimate models the real battery draw (inverter idle overhead + AC load
-// divided by conversion efficiency) and is corrected by a calibration factor
-// learned by comparing the model against the measured DC power whenever the
-// system actually discharges. Smoothing uses a time-based EMA so the result is
-// independent of how often Venus OS publishes power updates.
+// While discharging, the battery meter is the ground truth and every sample
+// also trains the learned AC->DC model. On grid, the learned model translates
+// the AC load into the DC draw the battery would see. Smoothing uses a
+// time-based EMA so the result is independent of how often Venus OS publishes.
 func updatePowerEstimateLocked(now time.Time) {
 	dt := 1.0
 	if !state.LastPowerSample.IsZero() {
@@ -273,35 +305,57 @@ func updatePowerEstimateLocked(now time.Time) {
 	}
 	state.LastPowerSample = now
 
-	// DC power the inverter would need from the battery to serve the current AC load
-	modelWatts := InverterIdleWatts + state.AcOutWatts/InverterEfficiency
-
-	sample := modelWatts * state.LoadCalib
-	if state.BatteryAmps < -0.5 {
-		measured := math.Abs(state.BatteryAmps * state.BatteryVolts)
-		if measured > 0 {
-			// While discharging the battery meter is the ground truth
-			sample = measured
-			// Learn how far the model is from reality, so estimates made while
-			// on grid match what actually happens on battery. Skip tiny loads
-			// where the ratio is dominated by measurement noise.
-			if modelWatts > 25 {
-				ratio := measured / modelWatts
-				if ratio < CalibMin {
-					ratio = CalibMin
-				} else if ratio > CalibMax {
-					ratio = CalibMax
-				}
-				state.LoadCalib = emaStep(state.LoadCalib, ratio, dt, CalibEmaTau)
-			}
-		}
+	var sample float64
+	if state.BatteryAmps < -0.5 && state.BatteryVolts > 0 {
+		sample = math.Abs(state.BatteryAmps * state.BatteryVolts)
+		learnLoadModelLocked(state.AcOutWatts, sample, dt)
+	} else {
+		sample = state.ModelA*state.AcOutWatts + state.ModelB
 	}
 
 	if state.RuntimeWatts == 0 {
 		state.RuntimeWatts = sample
 	} else {
-		state.RuntimeWatts = emaStep(state.RuntimeWatts, sample, dt, RuntimeEmaTau)
+		state.RuntimeWatts = emaStep(state.RuntimeWatts, sample, dt, runtimeEmaTau)
 	}
+}
+
+// learnLoadModelLocked feeds one (AC watts, measured DC watts) observation into
+// the decayed least-squares statistics and refreshes the model coefficients.
+// Sample weight is its time span dt, so the fit is publish-rate independent.
+// Must be called with state.Lock held.
+func learnLoadModelLocked(ac, dc, dt float64) {
+	decay := math.Exp(-dt / learnForgetTau)
+	state.RegN = state.RegN*decay + dt
+	state.RegSx = state.RegSx*decay + dt*ac
+	state.RegSy = state.RegSy*decay + dt*dc
+	state.RegSxx = state.RegSxx*decay + dt*ac*ac
+	state.RegSxy = state.RegSxy*decay + dt*ac*dc
+	solveLoadModelLocked()
+	state.ModelDirty = true
+}
+
+// solveLoadModelLocked computes ModelA/ModelB from the learned statistics plus
+// two prior anchor points (at AC=0 and AC=priorAnchorAC). The anchors keep the
+// 2x2 system well conditioned even when the observed load barely varies: a
+// flat load only pins the total draw at one operating point, and the prior
+// decides how to split the correction between slope and idle overhead.
+func solveLoadModelLocked() {
+	n := state.RegN + 2*priorWeight
+	sx := state.RegSx + priorWeight*priorAnchorAC
+	sy := state.RegSy + priorWeight*(2*seedIdleWatts+seedSlope*priorAnchorAC)
+	sxx := state.RegSxx + priorWeight*priorAnchorAC*priorAnchorAC
+	sxy := state.RegSxy + priorWeight*priorAnchorAC*(seedSlope*priorAnchorAC+seedIdleWatts)
+
+	det := n*sxx - sx*sx
+	if det <= 0 {
+		return
+	}
+	a := (n*sxy - sx*sy) / det
+	b := (sy*sxx - sx*sxy) / det
+
+	state.ModelA = math.Min(math.Max(a, modelSlopeMin), modelSlopeMax)
+	state.ModelB = math.Min(math.Max(b, modelIdleMin), modelIdleMax)
 }
 
 // emaStep advances an exponential moving average by dt seconds toward sample,
@@ -311,74 +365,101 @@ func emaStep(prev, sample, dt, tau float64) float64 {
 	return prev + alpha*(sample-prev)
 }
 
-// calibrationFile is the on-disk format of the persisted calibration state
-type calibrationFile struct {
-	LoadCalib float64 `json:"load_calib"`
+// modelFile is the on-disk format of the persisted learned state
+type modelFile struct {
+	RegN            float64 `json:"reg_n"`
+	RegSx           float64 `json:"reg_sx"`
+	RegSy           float64 `json:"reg_sy"`
+	RegSxx          float64 `json:"reg_sxx"`
+	RegSxy          float64 `json:"reg_sxy"`
+	AvgBatteryVolts float64 `json:"avg_battery_volts"`
 }
 
-// loadCalibration restores the learned calibration factor from a previous run.
-// A missing file is normal on first start and is silently ignored.
-func loadCalibration(path string) {
+// loadModel restores the learned load model from a previous run. A missing or
+// invalid file is not an error: the model simply restarts from its prior.
+func loadModel(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		debugLog("No calibration file loaded (%v), starting neutral", err)
+		debugLog("No model file loaded (%v), starting from prior", err)
 		return
 	}
-	var cf calibrationFile
-	if err := json.Unmarshal(data, &cf); err != nil {
-		log.Printf("Calibration file %s is corrupted, ignoring: %v", path, err)
+	var mf modelFile
+	if err := json.Unmarshal(data, &mf); err != nil {
+		log.Printf("Model file %s is corrupted, ignoring: %v", path, err)
 		return
 	}
-	if cf.LoadCalib < CalibMin || cf.LoadCalib > CalibMax {
-		log.Printf("Calibration value %.3f in %s out of range, ignoring", cf.LoadCalib, path)
+	for _, v := range []float64{mf.RegN, mf.RegSx, mf.RegSy, mf.RegSxx, mf.RegSxy, mf.AvgBatteryVolts} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			log.Printf("Model file %s contains invalid values, ignoring", path)
+			return
+		}
+	}
+	if mf.RegN < 0 || mf.RegSxx < 0 {
+		log.Printf("Model file %s contains inconsistent statistics, ignoring", path)
 		return
 	}
+
 	state.Lock()
-	state.LoadCalib = cf.LoadCalib
+	state.RegN, state.RegSx, state.RegSy = mf.RegN, mf.RegSx, mf.RegSy
+	state.RegSxx, state.RegSxy = mf.RegSxx, mf.RegSxy
+	if mf.AvgBatteryVolts > 0 {
+		state.AvgBatteryVolts = mf.AvgBatteryVolts
+	}
+	solveLoadModelLocked()
+	a, b := state.ModelA, state.ModelB
 	state.Unlock()
-	log.Printf("Restored load calibration factor %.3f from %s", cf.LoadCalib, path)
+
+	log.Printf("Restored load model from %s: DC = %.3f*AC + %.1fW (%.0fs of discharge data)", path, a, b, mf.RegN)
 }
 
-// persistCalibration atomically writes the current calibration factor to disk
-func persistCalibration(path string) error {
-	state.RLock()
-	cf := calibrationFile{LoadCalib: state.LoadCalib}
-	state.RUnlock()
+// persistModel atomically writes the learned state to disk. The dirty flag is
+// cleared before writing and restored on failure, so learning that happens
+// mid-write is picked up by the next persist.
+func persistModel(path string) error {
+	state.Lock()
+	mf := modelFile{
+		RegN: state.RegN, RegSx: state.RegSx, RegSy: state.RegSy,
+		RegSxx: state.RegSxx, RegSxy: state.RegSxy,
+		AvgBatteryVolts: state.AvgBatteryVolts,
+	}
+	state.ModelDirty = false
+	state.Unlock()
 
-	data, err := json.Marshal(cf)
+	data, err := json.Marshal(mf)
+	if err == nil {
+		tmp := path + ".tmp"
+		if err = os.WriteFile(tmp, data, 0o644); err == nil {
+			err = os.Rename(tmp, path)
+		}
+	}
 	if err != nil {
-		return err
+		state.Lock()
+		state.ModelDirty = true
+		state.Unlock()
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return err
 }
 
-// calibrationSaver periodically persists the calibration factor, but only when
-// it has actually drifted, to avoid wearing the Cerbo's flash storage.
-func calibrationSaver(path string) {
-	state.RLock()
-	lastSaved := state.LoadCalib
-	state.RUnlock()
-
+// modelSaver persists the learned model in a flash-friendly way: learning only
+// happens while discharging, so the single write happens once the discharge is
+// over. Normal grid operation never touches the disk.
+func modelSaver(path string) {
 	for {
-		time.Sleep(5 * time.Minute)
+		time.Sleep(time.Minute)
 
 		state.RLock()
-		current := state.LoadCalib
+		dirty := state.ModelDirty
+		discharging := state.BatteryAmps < -0.5
 		state.RUnlock()
 
-		if math.Abs(current-lastSaved) < 0.005 {
+		if !dirty || discharging {
 			continue
 		}
-		if err := persistCalibration(path); err != nil {
-			log.Printf("Error saving calibration to %s: %v", path, err)
+		if err := persistModel(path); err != nil {
+			log.Printf("Error saving model to %s: %v", path, err)
 			continue
 		}
-		lastSaved = current
-		debugLog("Calibration factor %.3f persisted to %s", current, path)
+		debugLog("Learned load model persisted to %s", path)
 	}
 }
 
@@ -427,16 +508,22 @@ func generateNUTVars() map[string]string {
 		runtimeSeconds = state.BatteryTimeToGo
 	} else {
 		calcWatts := state.RuntimeWatts
-		if calcWatts < MinCalcWatts {
-			calcWatts = MinCalcWatts
+		if calcWatts < 1 {
+			calcWatts = 1 // Div-by-zero guard; the real floor is the learned idle draw
 		}
 
 		capacityWh := BatteryCapacityWh
-		if state.BatteryCapacityAh > 0 {
-			capacityWh = state.BatteryCapacityAh * BatteryNominalV
+		if state.BatteryCapacityAh > 0 && state.AvgBatteryVolts > 0 {
+			capacityWh = state.BatteryCapacityAh * state.AvgBatteryVolts
 		}
 
-		usableSoc := state.BatterySoc - SocReservePercent
+		// Unusable reserve: the ESS minimum SoC limit when the system publishes
+		// one, a conservative default otherwise
+		socFloor := defaultSocFloor
+		if state.SocFloorMin >= 0 {
+			socFloor = state.SocFloorMin
+		}
+		usableSoc := state.BatterySoc - socFloor
 		if usableSoc < 0 {
 			usableSoc = 0
 		}

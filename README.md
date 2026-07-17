@@ -17,11 +17,10 @@ The server listens for MQTT messages from Venus OS and translates them into NUT 
 The `battery.runtime` value is computed differently depending on the power source:
 
 - **On battery**: Victron's own `TimeToGo` (computed by the BMS from the real discharge) is used directly. On grid this value is stale or absent, so it is ignored there.
-- **On grid**: the runtime is estimated from the AC load using a small power model — `DC watts = InverterIdleWatts + AC watts / InverterEfficiency` — smoothed with a time-based exponential moving average (`RuntimeEmaTau`, default 5 minutes) so short appliance spikes don't make the prediction bounce.
-- **Self-calibration**: whenever the system actually discharges, the measured DC power from the battery meter is compared against the model, and a correction factor is learned over time (`CalibEmaTau`). Estimates made while on grid therefore converge toward what really happens during an outage.
-- **Persistence**: the learned calibration factor is saved to `/data/cerbo-nut/calibration.json` (configurable via `--calib-file`, empty string disables it) so it survives restarts and firmware updates. Writes are atomic and only happen when the value actually drifts (checked every 5 minutes), to avoid wearing the flash storage.
-
-The relevant tuning knobs (`InverterEfficiency`, `InverterIdleWatts`, `SocReservePercent`, `RuntimeEmaTau`, ...) live in the `CONFIGURATION BLOCK` at the top of `main.go`.
+- **On grid**: the runtime is estimated from the AC load through a **self-learned linear model** `DC watts = a * AC watts + b` (conversion losses plus inverter idle overhead), smoothed with a time-based exponential moving average so short appliance spikes don't make the prediction bounce.
+- **Self-learning, zero tunables**: while the system actually discharges, every sample of measured DC battery power trains the model (decayed least-squares fit, regularized toward a sane prior so it stays well-behaved even with a perfectly flat load). Inverter efficiency and idle draw are learned from your own hardware — there is nothing to configure or tune. The average battery voltage used to convert the BMS-discovered Ah capacity into Wh is also measured, so 12/24/48V systems all work unmodified.
+- **SoC reserve**: if the ESS minimum SoC limit is published on MQTT (`Settings/CGwacs/BatteryLife/MinimumSocLimit`) it is used as the unusable reserve; otherwise a conservative 10% default applies.
+- **Persistence**: the learned model is saved to `/data/cerbo-nut/calibration.json` (configurable via `--calib-file`, empty string disables it) so it survives restarts and firmware updates. The write policy is deliberately flash-friendly: learning only happens while discharging, so the disk is written exactly once per discharge event (right after it ends) plus once on graceful shutdown — normal grid operation never writes to the NAND at all. Writes are atomic (temp file + rename).
 
 ## Compilation
 
