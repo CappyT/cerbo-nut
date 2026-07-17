@@ -12,6 +12,16 @@ This project provides a lightweight bridge between a Victron Energy system (via 
 ## Scope
 The server listens for MQTT messages from Venus OS and translates them into NUT variables. It emulates a `upsd` server, allowing any NUT client to query the state of the Victron system as if it were a physical UPS.
 
+## Battery Runtime Prediction
+
+The `battery.runtime` value is computed differently depending on the power source:
+
+- **On battery**: Victron's own `TimeToGo` (computed by the BMS from the real discharge) is used directly. On grid this value is stale or absent, so it is ignored there.
+- **On grid**: the runtime is estimated from the AC load using a small power model — `DC watts = InverterIdleWatts + AC watts / InverterEfficiency` — smoothed with a time-based exponential moving average (`RuntimeEmaTau`, default 5 minutes) so short appliance spikes don't make the prediction bounce.
+- **Self-calibration**: whenever the system actually discharges, the measured DC power from the battery meter is compared against the model, and a correction factor is learned over time (`CalibEmaTau`). Estimates made while on grid therefore converge toward what really happens during an outage.
+
+The relevant tuning knobs (`InverterEfficiency`, `InverterIdleWatts`, `SocReservePercent`, `RuntimeEmaTau`, ...) live in the `CONFIGURATION BLOCK` at the top of `main.go`.
+
 ## Compilation
 
 > [!IMPORTANT]

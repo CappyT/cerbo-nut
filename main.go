@@ -30,7 +30,18 @@ const (
 	// Power & Battery Specs
 	InverterMaxVA     = 1600.0 // Max VA for calculating ups.load percentage
 	BatteryCapacityWh = 5120.0 // Default Wh if capacity cannot be discovered via MQTT
+	BatteryNominalV   = 51.2   // Nominal battery voltage, used to convert discovered Ah to Wh
 	BatteryType       = "Li-Ion"
+
+	// Runtime Prediction Model
+	InverterEfficiency = 0.92  // AC->DC conversion efficiency of the inverter
+	InverterIdleWatts  = 12.0  // Constant DC overhead of the inverter while inverting (W)
+	SocReservePercent  = 10.0  // SoC kept as unusable reserve when estimating runtime (%)
+	MinCalcWatts       = 50.0  // Floor for the load used in the estimate, avoids absurd runtimes
+	RuntimeEmaTau      = 300.0 // Time constant (s) of the slow EMA feeding the runtime estimate
+	CalibEmaTau        = 600.0 // Time constant (s) of the learned AC->DC calibration factor
+	CalibMin           = 0.6   // Clamp for the learned calibration factor
+	CalibMax           = 1.8   // Clamp for the learned calibration factor
 
 	// Thresholds & Status
 	BatteryChargeLow     = "20"  // NUT variable (string) for low battery warning
@@ -60,15 +71,18 @@ type VictronData struct {
 	AcOutFreq         float64 // Output frequency
 	AcOutAmps         float64 // Output current
 	AcOutWatts        float64
-	AcOutVA           float64 // Apparent power (VA)
-	SmoothedWatts     float64 // Filter to stabilize the calculation
-	PortalID          string  // Extracted dynamically from the first MQTT message
+	AcOutVA           float64   // Apparent power (VA)
+	RuntimeWatts      float64   // Slow EMA of the DC-equivalent draw, feeds the runtime estimate
+	LoadCalib         float64   // Learned measured/modeled DC power ratio, updated while discharging
+	LastPowerSample   time.Time // Timestamp of the last power sample, for time-based EMA
+	PortalID          string    // Extracted dynamically from the first MQTT message
 }
 
 var state = &VictronData{
 	AcInVolts:  230.0, // Initialize to 230V to avoid false 'OB' status at app startup
 	AcOutVolts: 230.0, // Initialize to 230V by default
 	AcOutFreq:  50.0,  // Initialize to 50Hz by default
+	LoadCalib:  1.0,   // Start with a neutral calibration until a real discharge is observed
 }
 
 // VictronPayload is the standard JSON structure used by Venus OS on MQTT
@@ -206,17 +220,7 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 		state.BatteryCapacityAh = valFloat
 	} else if strings.Contains(topic, "/Ac/Consumption/L1/Power") || strings.Contains(topic, "/Ac/Out/L1/P") {
 		state.AcOutWatts = valFloat
-
-		// Calculate EMA based on MQTT data arrival (constant)
-		watts := state.AcOutWatts / 0.90
-		if state.BatteryAmps < -0.2 {
-			watts = math.Abs(state.BatteryAmps * state.BatteryVolts)
-		}
-		if state.SmoothedWatts == 0 {
-			state.SmoothedWatts = watts
-		} else {
-			state.SmoothedWatts = (watts * 0.15) + (state.SmoothedWatts * 0.85)
-		}
+		updatePowerEstimateLocked(time.Now())
 	} else if strings.Contains(topic, "/Ac/Consumption/L1/Current") || strings.Contains(topic, "/Ac/Out/L1/I") {
 		state.AcOutAmps = valFloat
 	} else if strings.HasSuffix(topic, "/Ac/Out/L1/S") {
@@ -232,6 +236,64 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	} else if strings.Contains(topic, "/Alarms/GridLost") {
 		state.GridLost = valFloat > 0
 	}
+}
+
+// updatePowerEstimateLocked refreshes the DC-equivalent power estimate used for
+// the runtime prediction. Must be called with state.Lock held.
+//
+// The estimate models the real battery draw (inverter idle overhead + AC load
+// divided by conversion efficiency) and is corrected by a calibration factor
+// learned by comparing the model against the measured DC power whenever the
+// system actually discharges. Smoothing uses a time-based EMA so the result is
+// independent of how often Venus OS publishes power updates.
+func updatePowerEstimateLocked(now time.Time) {
+	dt := 1.0
+	if !state.LastPowerSample.IsZero() {
+		dt = now.Sub(state.LastPowerSample).Seconds()
+		if dt <= 0 {
+			dt = 0.1
+		} else if dt > 60 {
+			dt = 60
+		}
+	}
+	state.LastPowerSample = now
+
+	// DC power the inverter would need from the battery to serve the current AC load
+	modelWatts := InverterIdleWatts + state.AcOutWatts/InverterEfficiency
+
+	sample := modelWatts * state.LoadCalib
+	if state.BatteryAmps < -0.5 {
+		measured := math.Abs(state.BatteryAmps * state.BatteryVolts)
+		if measured > 0 {
+			// While discharging the battery meter is the ground truth
+			sample = measured
+			// Learn how far the model is from reality, so estimates made while
+			// on grid match what actually happens on battery. Skip tiny loads
+			// where the ratio is dominated by measurement noise.
+			if modelWatts > 25 {
+				ratio := measured / modelWatts
+				if ratio < CalibMin {
+					ratio = CalibMin
+				} else if ratio > CalibMax {
+					ratio = CalibMax
+				}
+				state.LoadCalib = emaStep(state.LoadCalib, ratio, dt, CalibEmaTau)
+			}
+		}
+	}
+
+	if state.RuntimeWatts == 0 {
+		state.RuntimeWatts = sample
+	} else {
+		state.RuntimeWatts = emaStep(state.RuntimeWatts, sample, dt, RuntimeEmaTau)
+	}
+}
+
+// emaStep advances an exponential moving average by dt seconds toward sample,
+// using a time constant tau. Equivalent alpha = 1 - e^(-dt/tau).
+func emaStep(prev, sample, dt, tau float64) float64 {
+	alpha := 1.0 - math.Exp(-dt/tau)
+	return prev + alpha*(sample-prev)
 }
 
 func getFloat(unk interface{}) (float64, bool) {
@@ -271,21 +333,24 @@ func generateNUTVars() map[string]string {
 	vars["battery.charge.low"] = BatteryChargeLow
 	vars["battery.runtime.low"] = BatteryRuntimeLow
 
+	// Victron's TimeToGo is only meaningful while actually discharging; on grid
+	// it is stale or absent, so there we rely on our own load-based estimate.
+	onBattery := state.GridLost || state.AcInVolts < GridLostVoltageLimit
 	var runtimeSeconds float64
-	if state.BatteryTimeToGo > 0 {
+	if onBattery && state.BatteryTimeToGo > 0 {
 		runtimeSeconds = state.BatteryTimeToGo
 	} else {
-		calcWatts := state.SmoothedWatts
-		if calcWatts < 50 {
-			calcWatts = 50
+		calcWatts := state.RuntimeWatts
+		if calcWatts < MinCalcWatts {
+			calcWatts = MinCalcWatts
 		}
 
 		capacityWh := BatteryCapacityWh
 		if state.BatteryCapacityAh > 0 {
-			capacityWh = state.BatteryCapacityAh * 51.2
+			capacityWh = state.BatteryCapacityAh * BatteryNominalV
 		}
 
-		usableSoc := state.BatterySoc - 10.0
+		usableSoc := state.BatterySoc - SocReservePercent
 		if usableSoc < 0 {
 			usableSoc = 0
 		}
@@ -293,6 +358,9 @@ func generateNUTVars() map[string]string {
 		remainingWh := capacityWh * (usableSoc / 100.0)
 		runtimeSeconds = (remainingWh / calcWatts) * 3600.0
 	}
+	// Report in whole minutes: sub-minute jitter carries no information for NUT
+	// clients and only adds noise to history graphs.
+	runtimeSeconds = math.Round(runtimeSeconds/60.0) * 60.0
 	vars["battery.runtime"] = fmt.Sprintf("%.0f", runtimeSeconds)
 
 	vars["ups.status"] = generateStatus(runtimeSeconds)
