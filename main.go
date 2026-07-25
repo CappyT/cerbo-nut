@@ -63,9 +63,10 @@ type VictronData struct {
 	AcOutWatts        float64
 	AcOutVA           float64   // Apparent power (VA)
 	RuntimeWatts      float64   // Slow EMA of the DC-equivalent draw, feeds the runtime estimate
-	AvgBatteryVolts   float64   // Slow EMA of measured battery voltage, converts discovered Ah to Wh
+	AvgBatteryVolts   float64   // Slow EMA of the voltage measured while discharging, converts discovered Ah to Wh
 	SocFloorMin       float64   // ESS minimum SoC limit discovered via MQTT, <0 = not published
 	LastPowerSample   time.Time // Timestamp of the last power sample, for time-based EMA
+	LastVoltsSample   time.Time // Timestamp of the last voltage sample, for time-based EMA
 	PortalID          string    // Extracted dynamically from the first MQTT message
 
 	// Learned AC->DC load model: DC watts = ModelA*AC + ModelB. The coefficients
@@ -242,15 +243,7 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 		state.BatterySoc = valFloat
 	} else if strings.HasSuffix(topic, "/Dc/Battery/Voltage") {
 		state.BatteryVolts = valFloat
-		// Long-horizon average voltage: converts discovered Ah capacity to Wh
-		// without hardcoding the system's nominal voltage (12/24/48V all work)
-		if valFloat > 0 {
-			if state.AvgBatteryVolts == 0 {
-				state.AvgBatteryVolts = valFloat
-			} else {
-				state.AvgBatteryVolts = emaStep(state.AvgBatteryVolts, valFloat, 1.0, voltsEmaTau)
-			}
-		}
+		updateAvgVoltsLocked(valFloat, time.Now())
 	} else if strings.HasSuffix(topic, "/Settings/CGwacs/BatteryLife/MinimumSocLimit") {
 		state.SocFloorMin = valFloat
 	} else if strings.HasSuffix(topic, "/Dc/Battery/Current") {
@@ -287,15 +280,7 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 // the AC load into the DC draw the battery would see. Smoothing uses a
 // time-based EMA so the result is independent of how often Venus OS publishes.
 func updatePowerEstimateLocked(now time.Time) {
-	dt := 1.0
-	if !state.LastPowerSample.IsZero() {
-		dt = now.Sub(state.LastPowerSample).Seconds()
-		if dt <= 0 {
-			dt = 0.1
-		} else if dt > 60 {
-			dt = 60
-		}
-	}
+	dt := sampleDt(now, state.LastPowerSample)
 	state.LastPowerSample = now
 
 	var sample float64
@@ -311,6 +296,41 @@ func updatePowerEstimateLocked(now time.Time) {
 	} else {
 		state.RuntimeWatts = emaStep(state.RuntimeWatts, sample, dt, runtimeEmaTau)
 	}
+}
+
+// updateAvgVoltsLocked refreshes the average battery voltage used to convert
+// the BMS-discovered Ah capacity into Wh. Only samples taken while the battery
+// actually discharges count: the voltage the system dwells at on grid
+// (float/absorption) sits well above the discharge plateau and would inflate
+// the capacity estimate. Must be called with state.Lock held.
+func updateAvgVoltsLocked(volts float64, now time.Time) {
+	dt := sampleDt(now, state.LastVoltsSample)
+	state.LastVoltsSample = now
+	if volts <= 0 || state.BatteryAmps >= -0.5 {
+		return
+	}
+	if state.AvgBatteryVolts == 0 {
+		state.AvgBatteryVolts = volts
+	} else {
+		state.AvgBatteryVolts = emaStep(state.AvgBatteryVolts, volts, dt, voltsEmaTau)
+	}
+}
+
+// sampleDt returns the seconds elapsed between two samples, clamped to
+// (0.1, 60] so stale, duplicate, or out-of-order timestamps cannot produce a
+// runaway time-based EMA step. A zero last timestamp yields 1s.
+func sampleDt(now, last time.Time) float64 {
+	if last.IsZero() {
+		return 1.0
+	}
+	dt := now.Sub(last).Seconds()
+	if dt <= 0 {
+		return 0.1
+	}
+	if dt > 60 {
+		return 60
+	}
+	return dt
 }
 
 // learnLoadModelLocked feeds one (AC watts, measured DC watts) observation into
