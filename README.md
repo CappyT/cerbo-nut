@@ -14,7 +14,7 @@ The server listens for MQTT messages from Venus OS and translates them into NUT 
 
 ## Configuration
 
-Everything is configured through a TOML file, with optional environment variable overrides. Resolution order is: **built-in defaults < config file < `CERBO_NUT_*` environment variables**. All values are optional — with no config file at all, the server runs with the same defaults the project has always had.
+Everything is configured through a TOML file, with optional environment variable overrides. Resolution order is: **built-in defaults < config file < `CERBO_NUT_*` environment variables**. All values are optional: with no config file at all, the server runs entirely on built-in defaults.
 
 - Default config path: `/data/cerbo-nut/config.toml` (missing file = defaults apply)
 - Override the path with `--config /path/to/config.toml` or `CERBO_NUT_CONFIG=/path/to/config.toml`
@@ -68,7 +68,7 @@ Behavior follows the NUT protocol (RFC 9271), matching what a real `upsd` does:
 - `GET NUMLOGINS` and `LIST CLIENT` report the clients actually logged in.
 - **Per-user network ACL**: `allowed_networks` limits an account to a list of CIDR ranges or bare IPs (IPv4 and IPv6). Authenticating from outside the list fails with the same `ACCESS-DENIED` as a wrong password, so probing reveals nothing. Accounts without the key work from anywhere.
 
-Authentication is opt-in: with no users configured the server runs in open mode (any client accepted, its historical behavior), which is a perfectly fine choice on a trusted LAN. The startup log states which mode is active.
+Authentication is opt-in: with no users configured the server runs in open mode (any client accepted), which is a perfectly fine choice on a trusted LAN. The startup log states which mode is active.
 
 ## Battery Runtime Prediction
 
@@ -100,9 +100,6 @@ git push origin v1.0.0
 The `release` workflow then cross-compiles the binaries (stamping the version into the build), generates release notes, and attaches everything to the GitHub release. Every push and pull request is also built and vetted by the `ci` workflow.
 
 ## Compilation
-
-> [!NOTE]
-> No source changes are needed to customize the server: hardware values like `inverter_max_va`, `battery_capacity_wh`, and `device.model` are set in the config file (see [Configuration](#configuration)).
 
 Since the Cerbo GX uses an ARM architecture (usually ARMv7), you need to cross-compile the binary if you are developing on a different architecture (like x86_64).
 
