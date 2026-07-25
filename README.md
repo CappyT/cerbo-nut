@@ -80,6 +80,12 @@ The `battery.runtime` value is computed differently depending on the power sourc
 - **SoC reserve**: if the ESS minimum SoC limit is published on MQTT (`Settings/CGwacs/BatteryLife/MinimumSocLimit`) it is used as the unusable reserve; otherwise a conservative 10% default applies.
 - **Persistence**: the learned model is saved to `/data/cerbo-nut/calibration.json` (configurable via `server.state_file` / `CERBO_NUT_STATE_FILE`, empty string disables it) so it survives restarts and firmware updates. The write policy is deliberately flash-friendly: learning only happens while discharging, so the disk is written exactly once per discharge event (right after it ends) plus once on graceful shutdown — normal grid operation never writes to the NAND at all. Writes are atomic (temp file + rename).
 
+### Limitations
+
+- **Single-phase only**: AC load and grid-loss detection read the L1 phase exclusively. On a three-phase system the model would learn the DC draw against a third of the real load (over-reporting the runtime), and a grid failure on L2 or L3 would not raise `OB`.
+- **Sized for small inverters**: the learned idle overhead is clamped to 100 W, which covers single units up to roughly 8 kVA. Larger or multi-unit setups idle above that clamp, so on-grid predictions stay accurate near the learned operating point but skew when extrapolating far from it.
+- Battery voltage is **not** a limitation: 12/24/48 V systems all work unmodified, since the average discharge voltage is measured rather than assumed.
+
 ## Releases
 
 Prebuilt binaries are published on the [GitHub Releases page](../../releases) for `linux-armv7` (Cerbo GX), `linux-arm64`, and `linux-amd64`, along with SHA-256 checksums. If you just want to run the server, download the `armv7` binary from the latest release and skip the compilation section.
