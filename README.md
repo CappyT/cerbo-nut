@@ -97,7 +97,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-The `release` workflow then cross-compiles the binaries (stamping the version into the build), generates release notes, and attaches everything to the GitHub release. Every push and pull request is also built and vetted by the `ci` workflow.
+Pushing the tag triggers both workflows: `ci` checks formatting, vets, and tests the code, while `release` cross-compiles the binaries (stamping the version into the build), generates release notes, and attaches everything to the GitHub release. Nothing runs on ordinary pushes or pull requests.
 
 ## Compilation
 

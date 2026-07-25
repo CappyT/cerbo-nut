@@ -3,12 +3,6 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-    branches: ["release/v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "semver tag to create and release (e.g. v1.0.0)"
-        required: true
 
 permissions:
   contents: write
@@ -17,16 +11,9 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # The version comes from the tag name, the dispatch input, or a
-      # release/vX.Y.Z branch name. In the last two cases the tag does not
-      # exist yet and is created by the release step below.
       - name: resolve version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
-          else
-            V="${GITHUB_REF_NAME#release/}"
-          fi
+          V="${GITHUB_REF_NAME}"
           echo "$V" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
             || { echo "'$V' is not a valid semver tag (vX.Y.Z)"; exit 1; }
           echo "VERSION=$V" >> "$GITHUB_ENV"
@@ -53,8 +40,6 @@ jobs:
       - name: checksums
         run: cd dist && sha256sum * > checksums.txt
 
-      # On workflow_dispatch the tag does not exist yet: the release creation
-      # also creates it, pointing at the commit this workflow ran on.
       - name: create github release
         uses: softprops/action-gh-release@v2
         with:
