@@ -78,7 +78,7 @@ The `battery.runtime` value is computed differently depending on the power sourc
 - **On grid**: the runtime is estimated from the AC load through a **self-learned linear model** `DC watts = a * AC watts + b` (conversion losses plus inverter idle overhead), smoothed with a time-based exponential moving average so short appliance spikes don't make the prediction bounce.
 - **Self-learning, zero tunables**: while the system actually discharges, every sample of measured DC battery power trains the model (decayed least-squares fit, regularized toward a sane prior so it stays well-behaved even with a perfectly flat load). Inverter efficiency and idle draw are learned from your own hardware — there is nothing to configure or tune. The average battery voltage used to convert the BMS-discovered Ah capacity into Wh is also measured, so 12/24/48V systems all work unmodified.
 - **SoC reserve**: if the ESS minimum SoC limit is published on MQTT (`Settings/CGwacs/BatteryLife/MinimumSocLimit`) it is used as the unusable reserve; otherwise a conservative 10% default applies.
-- **Persistence**: the learned model is saved to `/data/cerbo-nut/calibration.json` (configurable via `--calib-file`, empty string disables it) so it survives restarts and firmware updates. The write policy is deliberately flash-friendly: learning only happens while discharging, so the disk is written exactly once per discharge event (right after it ends) plus once on graceful shutdown — normal grid operation never writes to the NAND at all. Writes are atomic (temp file + rename).
+- **Persistence**: the learned model is saved to `/data/cerbo-nut/calibration.json` (configurable via `server.state_file` / `CERBO_NUT_STATE_FILE`, empty string disables it) so it survives restarts and firmware updates. The write policy is deliberately flash-friendly: learning only happens while discharging, so the disk is written exactly once per discharge event (right after it ends) plus once on graceful shutdown — normal grid operation never writes to the NAND at all. Writes are atomic (temp file + rename).
 
 ## Releases
 
@@ -103,13 +103,13 @@ Since the Cerbo GX uses an ARM architecture (usually ARMv7), you need to cross-c
 ### Local Compilation (Your machine)
 To compile for your local machine:
 ```bash
-go build -o cerbo-nut main.go
+go build -o cerbo-nut .
 ```
 
 ### Cross-Compilation for Cerbo GX (ARM)
 To compile for the Cerbo GX (optimized for size and portability):
 ```bash
-env GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w" -o cerbo-nut main.go
+env GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w" -o cerbo-nut .
 ```
 *Note: Using `CGO_ENABLED=0` ensures a statically-linked binary, and `-ldflags="-s -w"` reduces the binary size by removing debug information.*
 
